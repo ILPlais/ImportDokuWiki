@@ -54,21 +54,21 @@ local ALIASES = {
 	objectpascal = "pascal",
 }
 
--- Attributs CodePrism que l'on peut transmettre depuis le Markdown, par ex. :
+-- Attributs CodePrism que l'on peut transmettre depuis le Markdown, par ex. :
 --   ```{.python title=hello.py hl=2-4}
 local PASSTHROUGH = { "title", "el", "sl", "hl", "cmd", "cmdout", "css", "user" }
 
 function CodeBlock(block)
 	local tag = "<codeprism"
 
-	-- Le premier « classe » du bloc est le langage (```python)
+	-- Le premier « classe » du bloc est le langage (```python)
 	local lang = block.classes[1]
 	if lang and lang ~= "numberLines" then
 		lang = ALIASES[lang:lower()] or lang
 		tag = tag .. " lang=" .. lang
 	end
 
-	-- Numérotation des lignes : ```{.python .numberLines startFrom="10"}
+	-- Numérotation des lignes : ```{.python .numberLines startFrom="10"}
 	for _, class in ipairs(block.classes) do
 		if class == "numberLines" then
 			tag = tag .. " el=true"
@@ -86,8 +86,8 @@ function CodeBlock(block)
 		end
 	end
 
-	-- Bloc brut : Pandoc l'écrit tel quel dans la sortie DokuWiki
-	return pandoc.RawBlock("dokuwiki", tag .. ">\n" .. block.text .. "\n</codeprism>")
+	-- Bloc brut : Pandoc l'écrit tel quel dans la sortie DokuWiki
+	return pandoc.RawBlock("dokuwiki", tag .. ">\n" .. block.text .. "\n</codeprism>\n")
 end
 '''
 
