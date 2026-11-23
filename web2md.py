@@ -1,40 +1,46 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-web2md.py : convertit une page Web en Markdown.
+web2md.py : convertit une page Web en Markdown.
 
 Fonctionnement :
 	1. La page est téléchargée (--url), lue dans un fichier HTML local
 	   (--input) ou sur l'entrée standard.
-	2. Le contenu principal est repéré : sélecteur CSS fourni (--selector),
+	2. Le contenu principal est repéré : sélecteur CSS fourni (--selector),
 	   sinon balises sémantiques (<article>, <main>…), sinon analyse de la
 	   densité de texte. Menus, pieds de page, publicités, commentaires,
 	   boutons de partage, etc. sont retirés.
 	3. Les blocs de code (<pre>) sont extraits à part, avec leur langage
-	   (détecté d'après les classes CSS : language-xxx, highlight-source-xxx…),
-	   puis remis tels quels dans des blocs « ``` » : l'indentation
+	   (détecté d'après les classes CSS : language-xxx, highlight-source-xxx…),
+	   puis remis tels quels dans des blocs « ``` » : l'indentation
 	   (tabulations comprises) n'est jamais modifiée. Les numéros de ligne
-	   et les boutons « Copier » sont supprimés.
+	   et les boutons « Copier » sont supprimés.
 	4. Images, vidéos, sons et contenus intégrés (iframe) sont conservés.
 	   Les liens sont rendus absolus ou, avec --download-media, les fichiers
 	   sont téléchargés et référencés par un chemin relatif.
-	   Les images « redimensionnées / converties » par certains sites sont
-	   remplacées par l'original quand il existe sur le serveur :
+	   Les images « redimensionnées / converties » par certains sites sont
+	   remplacées par l'original quand il existe sur le serveur :
 	   photo-800x750.png.webp -> photo.png (voir --no-original-images).
-	5. Le HTML nettoyé est converti en Markdown par « markdownify ».
+	5. Le HTML nettoyé est converti en Markdown par « markdownify ».
 
-Dépendances :
+Dépendances :
 	pip install requests beautifulsoup4 markdownify lxml
 
-Les messages d'état sont écrits sur la sortie d'erreur : le Markdown peut donc
+Les messages d'état sont écrits sur la sortie d'erreur : le Markdown peut donc
 être redirigé ou envoyé directement à md2dokuwiki.py.
 
-Exemples :
+Exemples :
 	python3 web2md.py --url https://exemple.fr/article --output article.md
 	python3 web2md.py --url https://exemple.fr/article --output article.md --download-media
 	python3 web2md.py --input page.html --base-url https://exemple.fr/ --selector "div.post"
 	python3 web2md.py --url https://exemple.fr/article | python3 md2dokuwiki.py > article.txt
+
+Documentation :
+	python3 -m pydoc web2md
 """
+
+# Annotations de type évaluées à la demande (syntaxe « str | None » dès Python 3.7)
+from __future__ import annotations
 
 import argparse
 import base64
@@ -48,7 +54,7 @@ from urllib.parse import unquote, urljoin, urlparse
 
 try:
 	import requests
-	from bs4 import BeautifulSoup, NavigableString
+	from bs4 import BeautifulSoup, NavigableString, Tag
 	from markdownify import ATX, markdownify
 except ImportError as error:
 	print(
@@ -67,21 +73,21 @@ DEFAULT_USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 F
 # Analyseur HTML : lxml s'il est installé (plus rapide et plus tolérant)
 HTML_PARSER = 'lxml' if importlib.util.find_spec('lxml') else 'html.parser'
 
-# Un candidat « contenu principal » doit contenir au moins ce nombre de caractères
+# Un candidat « contenu principal » doit contenir au moins ce nombre de caractères
 MIN_TEXT_LENGTH = 200
 
 # Taille maximale d'un média téléchargé (les fichiers plus gros sont ignorés)
 MAX_MEDIA_SIZE = 50 * 1024 * 1024
 
 # Balises supprimées partout dans la page (aucun intérêt dans un Markdown).
-# Remarque : <form> n'est volontairement pas listé, car certaines pages (ASP.NET)
+# Remarque : <form> n'est volontairement pas listé, car certaines pages (ASP.NET)
 # enveloppent tout leur contenu dans un formulaire.
 JUNK_TAGS = [
 	'script', 'style', 'noscript', 'template', 'svg', 'canvas',
 	'nav', 'footer', 'aside', 'dialog', 'input', 'select', 'button',
 ]
 
-# Candidats « contenu principal », par ordre de préférence
+# Candidats « contenu principal », par ordre de préférence
 MAIN_SELECTORS = [
 	'article',
 	'main',
@@ -97,8 +103,8 @@ MAIN_SELECTORS = [
 	'.content',
 ]
 
-# Classes ou identifiants qui désignent des éléments « parasites » dans le contenu
-# (le mot doit être entouré de « - », « _ », d'espaces ou du début/fin de chaîne)
+# Classes ou identifiants qui désignent des éléments « parasites » dans le contenu
+# (le mot doit être entouré de « - », « _ », d'espaces ou du début/fin de chaîne)
 NOISE_REGEX = re.compile(
 	r'(?:^|[\s_-])(?:sidebar|share|sharing|social|related|newsletter|subscribe|'
 	r'cookies?|consent|advert(?:isement)?s?|ads?|promo|breadcrumbs?|pagination|'
@@ -106,13 +112,13 @@ NOISE_REGEX = re.compile(
 	re.IGNORECASE,
 )
 
-# Symboles des ancres de titres (« # », « ¶ »…) : inutiles en Markdown
+# Symboles des ancres de titres (« # », « ¶ »…) : inutiles en Markdown
 ANCHOR_SYMBOLS_REGEX = re.compile('[\\s\u200b#¶§🔗¤]+')
 
 # --- Blocs de code ---------------------------------------------------------
 
 # Jeton qui remplace temporairement chaque bloc de code pendant la conversion
-# (uniquement des lettres et chiffres : markdownify n'y touche pas)
+# (uniquement des lettres et chiffres : markdownify n'y touche pas)
 TOKEN_FORMAT = 'ZZCODEBLOCK{}ZZ'
 TOKEN_REGEX = re.compile(r'^(?P<prefix>[^\n]*?)ZZCODEBLOCK(?P<index>\d+)ZZ[ \t]*$', re.MULTILINE)
 
@@ -123,20 +129,20 @@ CODE_JUNK_SELECTOR = ', '.join([
 	'.lnt', '.ln', '.hljs-ln-numbers', '.hljs-ln-n', '.gutter',
 ])
 
-# Conteneurs de ligne : un retour à la ligne est ajouté s'il manque
+# Conteneurs de ligne : un retour à la ligne est ajouté s'il manque
 CODE_LINE_SELECTOR = 'span.line, div.line, div.code-line, span.code-line, div.ec-line, span.cl'
 
 # Attributs HTML qui peuvent contenir le nom du langage
 LANGUAGE_ATTRIBUTES = ['data-lang', 'data-language', 'data-code-language']
 
 # Motifs de classes CSS indiquant le langage.
-# Pour <pre> et <code> : language-xxx, lang-xxx, highlight-xxx, highlight-source-xxx
+# Pour <pre> et <code> : language-xxx, lang-xxx, highlight-xxx, highlight-source-xxx
 ELEMENT_LANGUAGE_PATTERNS = [
 	re.compile(r'^highlight-source-([\w+#.-]+)$', re.IGNORECASE),
 	re.compile(r'^(?:language|highlight)[-_]([\w+#.-]+)$', re.IGNORECASE),
 	re.compile(r'^lang[-_]([\w+#.-]+)$', re.IGNORECASE),
 ]
-# Pour les conteneurs parents, on reste plus prudent (pas de « lang-fr » de page)
+# Pour les conteneurs parents, on reste plus prudent (pas de « lang-fr » de page)
 WRAPPER_LANGUAGE_PATTERNS = ELEMENT_LANGUAGE_PATTERNS[:2]
 
 # Valeurs qui ne désignent pas un vrai langage
@@ -153,10 +159,10 @@ SOURCE_CODE_CLASSES = {'sourcecode', 'numbersource', 'numberlines'}
 # Attributs utilisés par le chargement différé des images (lazy-loading)
 LAZY_ATTRIBUTES = ['data-src', 'data-original', 'data-lazy-src', 'data-lazy', 'data-url']
 
-# Double extension laissée par une conversion WebP : photo.jpg.webp -> photo.jpg
+# Double extension laissée par une conversion WebP : photo.jpg.webp -> photo.jpg
 WEBP_SUFFIX_REGEX = re.compile(r'(\.(?:png|jpe?g|gif|bmp|tiff?|avif))\.webp$', re.IGNORECASE)
 
-# Taille d'affichage ajoutée au nom par les CMS (WordPress…) : photo-800x750.png -> photo.png
+# Taille d'affichage ajoutée au nom par les CMS (WordPress…) : photo-800x750.png -> photo.png
 SIZE_SUFFIX_REGEX = re.compile(r'-\d{2,5}x\d{2,5}(?=(?:\.[A-Za-z0-9]+)+$)')
 
 
@@ -164,30 +170,61 @@ SIZE_SUFFIX_REGEX = re.compile(r'-\d{2,5}x\d{2,5}(?=(?:\.[A-Za-z0-9]+)+$)')
 # Utilitaires
 # ---------------------------------------------------------------------------
 
-def log(message):
-	"""Affiche un message d'état sur la sortie d'erreur."""
+def log(message: str) -> None:
+	"""Affiche un message d'état sur la sortie d'erreur.
+
+	La sortie standard reste ainsi réservée au Markdown produit.
+
+	Args:
+		message (str): texte à afficher.
+	"""
 	print(message, file = sys.stderr)
 
 
-def remove(element):
-	"""Supprime un élément, sauf s'il a déjà été supprimé avec son parent."""
+def remove(element: Tag) -> None:
+	"""Supprime un élément, sauf s'il a déjà été supprimé avec son parent.
+
+	Args:
+		element (Tag): élément HTML à supprimer de l'arbre.
+	"""
 	if not element.decomposed:
 		element.decompose()
 
 
-def class_list(element):
-	"""Retourne les classes CSS d'un élément sous forme de liste."""
+def class_list(element: Tag) -> list[str]:
+	"""Retourne les classes CSS d'un élément sous forme de liste.
+
+	Args:
+		element (Tag): élément HTML dont on lit l'attribut « `class` ».
+
+	Returns:
+		list[str]: noms des classes (liste vide si l'élément n'en a pas).
+	"""
 	value = element.get('class') or []
 	return [value] if isinstance(value, str) else list(value)
 
 
-def text_length(element):
-	"""Nombre de caractères de texte (espaces normalisés) d'un élément."""
+def text_length(element: Tag) -> int:
+	"""Compte les caractères de texte d'un élément (espaces normalisés).
+
+	Args:
+		element (Tag): élément HTML à mesurer (enfants compris).
+
+	Returns:
+		int: nombre de caractères du texte visible.
+	"""
 	return len(element.get_text(' ', strip = True))
 
 
-def link_density(element):
-	"""Part du texte contenue dans des liens (0 = aucun lien, 1 = que des liens)."""
+def link_density(element: Tag) -> float:
+	"""Calcule la part du texte d'un élément contenue dans des liens.
+
+	Args:
+		element (Tag): élément HTML à analyser.
+
+	Returns:
+		float: valeur entre `0` (aucun lien) et 1 (que des liens) ; `1` si l'élément ne contient aucun texte.
+	"""
 	total = text_length(element)
 	if total == 0:
 		return 1.0
@@ -195,8 +232,15 @@ def link_density(element):
 	return min(links / total, 1.0)
 
 
-def describe_element(element):
-	"""Décrit un élément de façon lisible : div#id.classe1.classe2."""
+def describe_element(element: Tag) -> str:
+	"""Décrit un élément de façon lisible, à la manière d'un sélecteur CSS.
+
+	Args:
+		element (Tag): élément HTML à décrire.
+
+	Returns:
+		str: description du type « `div#id.classe1.classe2` ».
+	"""
 	label = element.name
 	if element.get('id'):
 		label += '#' + str(element['id'])
@@ -211,24 +255,59 @@ def describe_element(element):
 # ---------------------------------------------------------------------------
 
 class MediaDownloader:
-	"""Télécharge les médias dans un dossier et renvoie leur chemin relatif."""
+	"""Télécharge les médias dans un dossier et renvoie leur chemin relatif.
 
-	def __init__(self, media_dir, link_base, user_agent, referer, timeout):
-		self.media_dir = Path(media_dir)
+	Attributes:
+		media_dir (Path): dossier où les médias sont enregistrés.
+		link_base (Path): dossier par rapport auquel les liens du Markdown sont calculés.
+		timeout (int): délai maximal d'une requête, en secondes.
+		session (requests.Session): session HTTP partagée (`User-Agent`, `Referer`).
+		cache (dict[str, str]): URL d'origine -> lien utilisé dans le Markdown.
+		used_names (set[str]): noms de fichiers déjà attribués.
+		count (int): nombre de fichiers enregistrés.
+	"""
+
+	def __init__(
+		self,
+		media_dir: str | Path,
+		link_base: str | Path,
+		user_agent: str,
+		referer: str,
+		timeout: int,
+	) -> None:
+		"""Prépare le téléchargeur.
+
+		Args:
+			media_dir (str | Path): dossier où enregistrer les médias (créé au besoin).
+			link_base (str | Path): dossier du fichier Markdown, base des liens relatifs.
+			user_agent (str): identifiant du navigateur envoyé aux serveurs.
+			referer (str): adresse de la page d'origine (chaîne vide pour ne pas l'envoyer).
+			timeout (int): délai maximal de chaque requête, en secondes.
+		"""
+		self.media_dir: Path = Path(media_dir)
 		# Dossier par rapport auquel les chemins du Markdown sont calculés
-		self.link_base = Path(link_base)
-		self.timeout = timeout
-		self.session = requests.Session()
+		self.link_base: Path = Path(link_base)
+		self.timeout: int = timeout
+		self.session: requests.Session = requests.Session()
 		self.session.headers.update({'User-Agent': user_agent})
 		# Certains sites refusent les images sans « Referer » (anti-hotlink)
 		if referer:
 			self.session.headers['Referer'] = referer
-		self.cache = {}         # URL d'origine -> lien utilisé dans le Markdown
-		self.used_names = set() # noms de fichiers déjà attribués
-		self.count = 0          # nombre de fichiers téléchargés
+		self.cache: dict[str, str] = {}   # URL d'origine -> lien utilisé dans le Markdown
+		self.used_names: set[str] = set() # noms de fichiers déjà attribués
+		self.count: int = 0               # nombre de fichiers téléchargés
 
-	def fetch(self, url):
-		"""Télécharge le média et renvoie le lien à utiliser (l'URL d'origine en cas d'échec)."""
+	def fetch(self, url: str) -> str:
+		"""Télécharge un média et renvoie le lien à utiliser dans le Markdown.
+
+		Les erreurs sont signalées sur la sortie d'erreur mais n'interrompent	pas la conversion : l'URL d'origine est alors conservée.
+
+		Args:
+			url (str): URL absolue (http/https) ou image intégrée « `data:` ».
+
+		Returns:
+			str: chemin relatif du fichier enregistré, ou l'URL d'origine en cas d'échec.
+		"""
 		if url in self.cache:
 			return self.cache[url]
 
@@ -239,7 +318,7 @@ class MediaDownloader:
 			elif urlparse(url).scheme in ('http', 'https'):
 				path = self.download(url)
 		except (OSError, ValueError, requests.RequestException) as error:
-			log(f'⚠️  Média ignoré ({error}) : {url[:80]}')
+			log(f'⚠️ Média ignoré ({error}) : {url[:80]}')
 
 		if path is None:
 			link = url
@@ -249,8 +328,17 @@ class MediaDownloader:
 		self.cache[url] = link
 		return link
 
-	def reserve_path(self, url, content_type = '', default_stem = 'media'):
-		"""Choisit un nom de fichier sûr et unique pour le média."""
+	def reserve_path(self, url: str, content_type: str = '', default_stem: str = 'media') -> Path:
+		"""Choisit un nom de fichier sûr et unique pour un média.
+
+		Args:
+			url (str): URL du média, dont le nom de fichier est repris (peut être vide).
+			content_type (str): type MIME, pour deviner l'extension si l'URL n'en a pas.
+			default_stem (str): nom de base utilisé si l'URL n'en fournit aucun.
+
+		Returns:
+			Path: chemin du fichier à créer dans le dossier des médias.
+		"""
 		self.media_dir.mkdir(parents = True, exist_ok = True)
 
 		# Nom d'après l'URL, réduit aux caractères sûrs
@@ -272,8 +360,20 @@ class MediaDownloader:
 		self.used_names.add(candidate)
 		return self.media_dir / candidate
 
-	def download(self, url):
-		"""Télécharge un fichier (en flux, avec limite de taille)."""
+	def download(self, url: str) -> Path:
+		"""Télécharge un fichier en flux, avec une limite de taille.
+
+		Args:
+			url (str): URL absolue (http/https) du média.
+
+		Returns:
+			Path: chemin du fichier enregistré.
+
+		Raises:
+			requests.RequestException: erreur réseau ou réponse HTTP en erreur.
+			ValueError: la réponse est une page HTML ou dépasse `MAX_MEDIA_SIZE`.
+			OSError: impossible d'écrire le fichier.
+		"""
 		path = None
 		try:
 			with self.session.get(url, stream = True, timeout = self.timeout) as response:
@@ -297,11 +397,22 @@ class MediaDownloader:
 			if path is not None and path.exists():
 				path.unlink()
 			raise
-		log(f'🖼️  Téléchargé : {path.name}')
+		log(f'🖼️ Téléchargé : {path.name}')
 		return path
 
-	def save_data_uri(self, url):
-		"""Enregistre une image intégrée en base64 (data:image/png;base64,…)."""
+	def save_data_uri(self, url: str) -> Path | None:
+		"""Enregistre une image intégrée en base64 (`data:image/png;base64,…`).
+
+		Args:
+			url (str): URI « `data:` » de l'image.
+
+		Returns:
+			Path | None: chemin du fichier créé, ou `None` si l'URI n'est pas en base64.
+
+		Raises:
+			ValueError: contenu base64 invalide (`binascii.Error`).
+			OSError: impossible d'écrire le fichier.
+		"""
 		match = re.match(r'data:([\w/+.-]*)(;base64)?,(.*)$', url, re.DOTALL)
 		if not match or not match.group(2):
 			return None
@@ -315,8 +426,17 @@ class MediaDownloader:
 # Images originales (sans suffixe de taille ni double extension .webp)
 # ---------------------------------------------------------------------------
 
-def original_candidates(url):
-	"""Liste les URL possibles de l'image originale, de la plus probable à l'URL d'origine."""
+def original_candidates(url: str) -> list[str]:
+	"""Liste les URL possibles de l'image originale.
+
+	Exemple : `photo-800x750.png.webp` donne, dans l'ordre, `photo.png`, `photo-800x750.png`, `photo.png.webp` puis `photo-800x750.png.webp`.
+
+	Args:
+		url (str): URL absolue de l'image telle qu'elle figure dans la page.
+
+	Returns:
+		list[str]: URL candidates, de la plus probable à l'URL d'origine (toujours en dernier ; seule si l'URL n'est pas http/https).
+	"""
 	parts = urlparse(url)
 	if parts.scheme not in ('http', 'https'):
 		return [url]
@@ -339,19 +459,40 @@ def original_candidates(url):
 
 
 class ImageResolver:
-	"""Remplace l'URL d'une image par celle de l'original, s'il existe sur le serveur."""
+	"""Remplace l'URL d'une image par celle de l'original, s'il existe sur le serveur.
 
-	def __init__(self, user_agent, referer, timeout):
-		self.timeout = timeout
-		self.session = requests.Session()
+	Attributes:
+		timeout (int): délai maximal d'une requête, en secondes.
+		session (requests.Session): session HTTP partagée (`User-Agent`, `Referer`).
+		cache (dict[str, str]): URL de la page -> URL retenue.
+		count (int): nombre d'originaux retrouvés.
+	"""
+
+	def __init__(self, user_agent: str, referer: str, timeout: int) -> None:
+		"""Prépare la recherche des originaux.
+
+		Args:
+			user_agent (str): identifiant du navigateur envoyé aux serveurs.
+			referer (str): adresse de la page d'origine (chaîne vide pour ne pas l'envoyer).
+			timeout (int): délai maximal de chaque requête, en secondes.
+		"""
+		self.timeout: int = timeout
+		self.session: requests.Session = requests.Session()
 		self.session.headers.update({'User-Agent': user_agent})
 		if referer:
 			self.session.headers['Referer'] = referer
-		self.cache = {}  # URL de la page -> URL retenue
-		self.count = 0   # nombre d'originaux retrouvés
+		self.cache: dict[str, str] = {}  # URL de la page -> URL retenue
+		self.count: int = 0              # nombre d'originaux retrouvés
 
-	def exists(self, url):
-		"""Vérifie qu'une URL renvoie bien une image (sans la télécharger)."""
+	def exists(self, url: str) -> bool:
+		"""Vérifie qu'une URL renvoie bien une image, sans la télécharger.
+
+		Args:
+			url (str): URL absolue à tester.
+
+		Returns:
+			bool: True si le serveur répond sans erreur avec un type image (ou un type absent / `application/octet-stream`).
+		"""
 		try:
 			response = self.session.head(url, allow_redirects = True, timeout = self.timeout)
 			if response.status_code >= 400:
@@ -368,8 +509,15 @@ class ImageResolver:
 			or content_type == 'application/octet-stream'
 		)
 
-	def resolve(self, url):
-		"""Renvoie l'URL de l'original, ou l'URL donnée si aucun original n'est trouvé."""
+	def resolve(self, url: str) -> str:
+		"""Cherche l'image originale correspondant à une URL.
+
+		Args:
+			url (str): URL absolue de l'image telle qu'elle figure dans la page.
+
+		Returns:
+			str: URL de l'original, ou l'URL donnée si aucun original n'est trouvé.
+		"""
 		if url in self.cache:
 			return self.cache[url]
 
@@ -391,16 +539,29 @@ class ImageResolver:
 # Recherche du contenu principal
 # ---------------------------------------------------------------------------
 
-def remove_junk(soup):
-	"""Supprime scripts, styles, menus, pieds de page, éléments cachés…"""
+def remove_junk(soup: BeautifulSoup) -> None:
+	"""Supprime scripts, styles, menus, pieds de page, éléments cachés…
+
+	Les balises listées dans JUNK_TAGS et les éléments masqués (attribut « `hidden` » ou style « `display: none` ») sont retirés de toute la page.
+
+	Args:
+		soup (BeautifulSoup): document HTML, modifié sur place.
+	"""
 	for tag in soup.find_all(JUNK_TAGS):
 		remove(tag)
 	for tag in soup.select('[hidden], [style*="display:none"], [style*="display: none"]'):
 		remove(tag)
 
 
-def extract_title(soup):
-	"""Titre de la page : premier <h1>, sinon og:title, sinon <title>."""
+def extract_title(soup: BeautifulSoup) -> str:
+	"""Trouve le titre de la page : premier `<h1>`, sinon `og:title`, sinon `<title>`.
+
+	Args:
+		soup (BeautifulSoup): document HTML.
+
+	Returns:
+		str: titre (espaces normalisés), ou chaîne vide s'il n'y en a pas.
+	"""
 	heading = soup.find('h1')
 	if heading and heading.get_text(strip = True):
 		return ' '.join(heading.get_text().split())
@@ -414,12 +575,27 @@ def extract_title(soup):
 	return ''
 
 
-def find_by_density(soup):
-	"""Repère le bloc qui concentre le plus de texte « rédactionnel » (méthode type Readability)."""
-	scores = {}
-	nodes = {}
+def find_by_density(soup: BeautifulSoup) -> Tag:
+	"""Repère le bloc qui concentre le plus de texte « rédactionnel ».
 
-	def add(node, points):
+	Méthode inspirée de Readability : chaque paragraphe (`<p>`, `<pre>`) donne des points à son parent et à son grand-parent`; le score est ensuite pénalisé par la densité de liens.
+
+	Args:
+		soup (BeautifulSoup): document HTML.
+
+	Returns:
+		Tag: élément retenu (le `<body>`, ou le document entier, à défaut).
+	"""
+	scores: dict[int, float] = {}
+	nodes: dict[int, Tag] = {}
+
+	def add(node: Tag | None, points: float) -> None:
+		"""Ajoute des points au score d'un élément.
+
+		Args:
+			node (Tag | None): élément à créditer (ignoré si `None`, `<html>` ou document).
+			points (float): nombre de points à ajouter.
+		"""
 		if node is None or node.name in ('html', '[document]'):
 			return
 		scores[id(node)] = scores.get(id(node), 0) + points
@@ -446,30 +622,49 @@ def find_by_density(soup):
 	return best
 
 
-def find_main_content(soup, selector):
-	"""Retourne l'élément qui contient le contenu principal de la page."""
+def find_main_content(soup: BeautifulSoup, selector: str | None) -> Tag:
+	"""Retourne l'élément qui contient le contenu principal de la page.
+
+	Ordre de recherche : sélecteur imposé, puis `MAIN_SELECTORS`, puis analyse de la densité de texte (`find_by_density`).
+
+	Args:
+		soup (BeautifulSoup): document HTML.
+		selector (str | None): sélecteur CSS imposé par l'utilisateur, ou None.
+
+	Returns:
+		Tag: élément du contenu principal.
+
+	Exceptions :
+		ValueError: sélecteur invalide, ou aucun élément ne lui correspond.
+	"""
 	# 1) Sélecteur imposé par l'utilisateur
 	if selector:
 		try:
 			node = soup.select_one(selector)
 		except Exception as error:
-			raise ValueError(f'sélecteur CSS invalide « {selector} » : {error}')
+			raise ValueError(f'sélecteur CSS invalide « {selector} » : {error}')
 		if node is None:
-			raise ValueError(f'aucun élément ne correspond au sélecteur « {selector} »')
+			raise ValueError(f'aucun élément ne correspond au sélecteur « {selector} »')
 		return node
 
-	# 2) Balises et classes usuelles : on garde le candidat le plus riche en texte
+	# 2) Balises et classes usuelles : on garde le candidat le plus riche en texte
 	for css in MAIN_SELECTORS:
 		candidates = [node for node in soup.select(css) if text_length(node) >= MIN_TEXT_LENGTH]
 		if candidates:
 			return max(candidates, key = text_length)
 
-	# 3) Dernier recours : analyse de la densité de texte
+	# 3) Dernier recours : analyse de la densité de texte
 	return find_by_density(soup)
 
 
-def remove_noise(root):
-	"""Retire du contenu les blocs parasites reconnus à leur classe ou identifiant."""
+def remove_noise(root: Tag) -> None:
+	"""Retire du contenu les blocs parasites reconnus à leur classe ou identifiant.
+
+	Les éléments dont la classe ou l'identifiant correspond à `NOISE_REGEX` sont supprimés, sauf le code et les conteneurs qui renferment du code ou la majeure partie du texte.
+
+	Args:
+		root (Tag): élément du contenu principal, modifié sur place.
+	"""
 	root_length = max(text_length(root), 1)
 
 	for element in root.find_all(True):
@@ -495,8 +690,16 @@ def remove_noise(root):
 # Blocs de code
 # ---------------------------------------------------------------------------
 
-def language_from_classes(classes, patterns):
-	"""Cherche un nom de langage dans une liste de classes CSS."""
+def language_from_classes(classes: list[str], patterns: list[re.Pattern[str]]) -> str:
+	"""Cherche un nom de langage dans une liste de classes CSS.
+
+	Args:
+		classes (list[str]): classes CSS de l'élément.
+		patterns (list[re.Pattern[str]]): motifs dont le groupe 1 capture le langage.
+
+	Returns:
+		str: nom du langage en minuscules, ou chaîne vide si aucun n'est trouvé.
+	"""
 	# SyntaxHighlighter : class="brush: python;"
 	match = re.search(r'brush:\s*([\w+#.-]+)', ' '.join(classes))
 	if match and match.group(1).lower() not in NON_LANGUAGES:
@@ -513,8 +716,17 @@ def language_from_classes(classes, patterns):
 	return ''
 
 
-def detect_language(pre):
-	"""Devine le langage d'un bloc de code (chaîne vide si inconnu)."""
+def detect_language(pre: Tag) -> str:
+	"""Devine le langage d'un bloc de code.
+
+	Sont examinés, dans l'ordre : les attributs `data-lang`…, les classes du `<pre>` et du `<code>`, les classes Pandoc (`sourceCode`), puis les classes des trois conteneurs parents.
+
+	Args:
+		pre (Tag): élément `<pre>` du bloc de code.
+
+	Returns:
+		str: nom du langage en minuscules, ou chaîne vide si inconnu.
+	"""
 	code = pre.find('code')
 	targets = [pre] + ([code] if code else [])
 
@@ -551,8 +763,17 @@ def detect_language(pre):
 	return ''
 
 
-def extract_code_text(pre):
-	"""Extrait le texte exact d'un bloc de code, sans numéros de ligne ni boutons."""
+def extract_code_text(pre: Tag) -> str:
+	"""Extrait le texte exact d'un bloc de code, sans numéros de ligne ni boutons.
+
+	L'indentation (tabulations comprises) est conservée ; seuls les espaces de fin de ligne et les lignes vides au début et à la fin sont retirés.
+
+	Args:
+		pre (Tag): élément `<pre>` du bloc de code (modifié : boutons, numéros… supprimés).
+
+	Returns:
+		str: code source, lignes séparées par « `\\n` ».
+	"""
 	for junk in pre.select(CODE_JUNK_SELECTOR):
 		remove(junk)
 
@@ -562,14 +783,14 @@ def extract_code_text(pre):
 
 	rows = pre.find_all('tr')
 	if rows:
-		# Colorateurs en tableau (highlight.js) : le code est dans la dernière cellule
+		# Colorateurs en tableau (highlight.js) : le code est dans la dernière cellule
 		lines = []
 		for row in rows:
 			cells = row.find_all(['td', 'th'])
 			lines.append(cells[-1].get_text() if cells else '')
 		text = '\n'.join(lines)
 	else:
-		# Colorateurs qui enveloppent chaque ligne dans un <span>/<div> sans « \n »
+		# Colorateurs qui enveloppent chaque ligne dans un `<span>`/`<div>` sans « `\n` »
 		for line in pre.select(CODE_LINE_SELECTOR):
 			sibling = line.next_sibling
 			followed_by_newline = isinstance(sibling, NavigableString) and sibling.startswith('\n')
@@ -577,7 +798,7 @@ def extract_code_text(pre):
 				line.append('\n')
 		text = pre.get_text()
 
-	# Normalisation : espaces insécables et caractères de largeur nulle -> rien d'utile dans du code
+	# Normalisation : espaces insécables et caractères de largeur nulle -> rien d'utile dans du code
 	text = text.replace('\r\n', '\n').replace('\r', '\n')
 	text = text.replace('\xa0', ' ').replace('\u200b', '')
 
@@ -591,15 +812,32 @@ def extract_code_text(pre):
 	return '\n'.join(lines)
 
 
-def build_fence(code, language):
-	"""Construit un bloc de code Markdown (barrière plus longue si le code contient « ``` »)."""
+def build_fence(code: str, language: str) -> str:
+	"""Construit un bloc de code Markdown délimité.
+
+	La barrière est allongée si le code contient lui-même « ``` ».
+
+	Args:
+		code (str): code source du bloc.
+		language (str): nom du langage (chaîne vide si inconnu).
+
+	Returns:
+		str: bloc Markdown complet, barrières d'ouverture et de fermeture comprises.
+	"""
 	longest = max((len(run) for run in re.findall(r'`{3,}', code)), default = 0)
 	fence = '`' * max(3, longest + 1)
 	return f'{fence}{language}\n{code}\n{fence}'
 
 
-def flatten_highlight_tables(soup, root):
-	"""Remplace les tableaux « numéros de ligne | code » (Pygments, Chroma) par leur seule colonne de code."""
+def flatten_highlight_tables(soup: BeautifulSoup, root: Tag) -> None:
+	"""Remplace les tableaux « numéros de ligne | code » par leur seule colonne de code.
+
+	Concerne les colorateurs Pygments (`table.highlighttable`) et Chroma (`table.lntable`).
+
+	Args:
+		soup (BeautifulSoup): document HTML, utilisé pour créer les nouvelles balises.
+		root (Tag): élément du contenu principal, modifié sur place.
+	"""
 	for table in root.select('table.highlighttable, table.lntable'):
 		cells = table.find_all('td')
 		if not cells:
@@ -610,9 +848,19 @@ def flatten_highlight_tables(soup, root):
 		table.replace_with(wrapper)
 
 
-def process_code_blocks(soup, root):
-	"""Remplace chaque <pre> par un jeton et renvoie la liste des blocs Markdown."""
-	blocks = []
+def process_code_blocks(soup: BeautifulSoup, root: Tag) -> list[str]:
+	"""Remplace chaque `<pre>` par un jeton et renvoie la liste des blocs Markdown.
+
+	Le jeton (`TOKEN_FORMAT`) protège le code pendant la conversion par markdownify ; `restore_code_blocks()` le remplace ensuite par le bloc.
+
+	Args:
+		soup (BeautifulSoup): document HTML, utilisé pour créer les jetons.
+		root (Tag): élément du contenu principal, modifié sur place.
+
+	Returns:
+		list[str]: blocs de code Markdown ; l'indice de chaque bloc est celui de son jeton.
+	"""
+	blocks: list[str] = []
 	for pre in root.find_all('pre'):
 		if pre.decomposed:
 			continue
@@ -629,10 +877,26 @@ def process_code_blocks(soup, root):
 	return blocks
 
 
-def restore_code_blocks(markdown, blocks):
-	"""Remet les blocs de code à la place des jetons, en respectant listes et citations."""
+def restore_code_blocks(markdown: str, blocks: list[str]) -> str:
+	"""Remet les blocs de code à la place des jetons, en respectant listes et citations.
 
-	def _replace(match):
+	Args:
+		markdown (str): Markdown produit par markdownify, contenant les jetons.
+		blocks (list[str]): blocs de code renvoyés par `process_code_blocks()`.
+
+	Returns:
+		str: Markdown avec les blocs de code en place.
+	"""
+
+	def _replace(match: re.Match[str]) -> str:
+		"""Construit le texte qui remplace un jeton.
+
+		Args:
+			match (re.Match[str]): correspondance de `TOKEN_REGEX` (groupes « prefix » et « index »).
+
+		Returns:
+			str: bloc de code, indenté selon le préfixe de la ligne (liste, citation).
+		"""
 		prefix = match.group('prefix')
 		block = blocks[int(match.group('index'))]
 
@@ -656,9 +920,17 @@ def restore_code_blocks(markdown, blocks):
 # Médias : images, vidéos, sons, contenus intégrés
 # ---------------------------------------------------------------------------
 
-def parse_srcset(value):
-	"""Retourne la liste (url, taille) d'un attribut srcset."""
-	candidates = []
+def parse_srcset(value: str) -> list[tuple[str, float]]:
+	"""Analyse un attribut srcset.
+
+	Args:
+		value (str): contenu de l'attribut, ex. : « a.jpg 480w, b.jpg 800w ».
+
+	Returns:
+		list[tuple[str, float]]: couples (url, taille) ; la taille vaut la largeur
+		                        (« `w` ») ou la densité (« `x` »), `0` si elle est absente.
+	"""
+	candidates: list[tuple[str, float]] = []
 	# Les candidats sont séparés par une virgule suivie d'une espace (ou d'un descripteur w/x)
 	for part in re.split(r'(?<=[wx]),\s*|,\s+', value.strip()):
 		tokens = part.split()
@@ -672,8 +944,15 @@ def parse_srcset(value):
 	return candidates
 
 
-def get_image_url(img):
-	"""Trouve la vraie URL d'une image (lazy-loading, srcset, <picture>)."""
+def get_image_url(img: Tag) -> str:
+	"""Trouve la vraie URL d'une image (`lazy-loading`, `srcset`, `<picture>`).
+
+	Args:
+		img (Tag): élément `<img>`.
+
+	Returns:
+		str: URL trouvée (éventuellement relative ou « `data:` »), ou chaîne vide.
+	"""
 	# 1) Attributs de chargement différé : ils contiennent le vrai fichier
 	for attribute in LAZY_ATTRIBUTES:
 		value = str(img.get(attribute) or '').strip()
@@ -699,16 +978,37 @@ def get_image_url(img):
 	return src
 
 
-def is_tracking_pixel(img):
-	"""Détecte les images de 1 ou 2 pixels (pixels espions)."""
+def is_tracking_pixel(img: Tag) -> bool:
+	"""Détecte les images de 1 ou 2 pixels (pixels espions).
+
+	Args:
+		img (Tag): élément `<img>`.
+
+	Returns:
+		bool: `True` si la largeur et la hauteur déclarées sont inférieures ou égales à `2`.
+	"""
 	try:
 		return int(img.get('width', 99)) <= 2 and int(img.get('height', 99)) <= 2
 	except (TypeError, ValueError):
 		return False
 
 
-def process_images(root, base_url, downloader, resolver):
-	"""Rend les URL des images absolues, retrouve les originaux (ou télécharge)."""
+def process_images(
+	root: Tag,
+	base_url: str,
+	downloader: MediaDownloader | None,
+	resolver: ImageResolver | None,
+) -> None:
+	"""Rend les URL des images absolues, retrouve les originaux et les télécharge.
+
+	Les images sans URL et les pixels espions sont supprimés.
+
+	Args:
+		root (Tag): élément du contenu principal, modifié sur place.
+		base_url (str): adresse de la page, pour rendre les URL absolues.
+		downloader (MediaDownloader | None): téléchargeur, ou `None` pour garder les URL.
+		resolver (ImageResolver | None): recherche des originaux, ou `None` pour la désactiver.
+	"""
 	for img in root.find_all('img'):
 		url = get_image_url(img)
 		if not url or is_tracking_pixel(img):
@@ -724,8 +1024,13 @@ def process_images(root, base_url, downloader, resolver):
 		img['src'] = url
 
 
-def process_figure_captions(soup, root):
-	"""Transforme chaque <figcaption> en paragraphe en italique."""
+def process_figure_captions(soup: BeautifulSoup, root: Tag) -> None:
+	"""Transforme chaque `<figcaption>` en paragraphe en italique.
+
+	Args:
+		soup (BeautifulSoup): document HTML, utilisé pour créer les nouvelles balises.
+		root (Tag): élément du contenu principal, modifié sur place.
+	"""
 	for caption in root.find_all('figcaption'):
 		text = ' '.join(caption.get_text().split())
 		if not text:
@@ -738,8 +1043,13 @@ def process_figure_captions(soup, root):
 		caption.replace_with(paragraph)
 
 
-def process_links(root, base_url):
-	"""Rend les liens absolus et retire les liens inutiles (ancres, javascript:…)."""
+def process_links(root: Tag, base_url: str) -> None:
+	"""Rend les liens absolus et retire les liens inutiles (ancres, javascript:…).
+
+	Args:
+		root (Tag): élément du contenu principal, modifié sur place.
+		base_url (str): adresse de la page, pour rendre les liens absolus.
+	"""
 	for link in root.find_all('a'):
 		href = str(link.get('href') or '').strip()
 		text = link.get_text()
@@ -761,8 +1071,24 @@ def process_links(root, base_url):
 		link['href'] = urljoin(base_url, href)
 
 
-def process_embedded_media(soup, root, base_url, downloader, resolver):
-	"""Remplace <video>, <audio> et <iframe> par des liens (Markdown n'a pas de balise équivalente)."""
+def process_embedded_media(
+	soup: BeautifulSoup,
+	root: Tag,
+	base_url: str,
+	downloader: MediaDownloader | None,
+	resolver: ImageResolver | None,
+) -> None:
+	"""Remplace `<video>`, `<audio>` et `<iframe>` par des liens.
+
+	Markdown n'a pas d'équivalent à ces balises : les vidéos et les sons deviennent un lien vers le fichier (précédé de l'image d'aperçu), les contenus intégrés un lien vers leur source.
+
+	Args:
+		soup (BeautifulSoup): document HTML, utilisé pour créer les nouvelles balises.
+		root (Tag): élément du contenu principal, modifié sur place.
+		base_url (str): adresse de la page, pour rendre les URL absolues.
+		downloader (MediaDownloader | None): téléchargeur, ou `None` pour garder les URL.
+		resolver (ImageResolver | None): recherche des originaux des aperçus, ou `None`.
+	"""
 
 	# Vidéos et sons : lien vers le fichier (+ image d'aperçu pour les vidéos)
 	for tag_name, label in (('video', 'Vidéo'), ('audio', 'Audio')):
@@ -817,15 +1143,44 @@ def process_embedded_media(soup, root, base_url, downloader, resolver):
 # Conversion
 # ---------------------------------------------------------------------------
 
-def clean_markdown(markdown):
-	"""Supprime les lignes vides en trop."""
+def clean_markdown(markdown: str) -> str:
+	"""Supprime les lignes vides en trop.
+
+	Args:
+		markdown (str): texte Markdown à nettoyer.
+
+	Returns:
+		str: texte sans lignes blanches multiples ni espaces au début et à la fin.
+	"""
 	markdown = re.sub(r'\n[ \t]+\n', '\n\n', markdown)
 	markdown = re.sub(r'\n{3,}', '\n\n', markdown)
 	return markdown.strip()
 
 
-def convert_page(content, base_url, selector, downloader, resolver, add_source):
-	"""Convertit le HTML d'une page en Markdown."""
+def convert_page(
+	content: bytes | str,
+	base_url: str,
+	selector: str | None,
+	downloader: MediaDownloader | None,
+	resolver: ImageResolver | None,
+	add_source: bool,
+) -> str:
+	"""Convertit le HTML d'une page en Markdown.
+
+	Args:
+		content (bytes | str): code HTML de la page.
+		base_url (str): adresse de la page (chaîne vide si inconnue).
+		selector (str | None): sélecteur CSS du contenu principal, ou `None` (détection automatique).
+		downloader (MediaDownloader | None): téléchargeur des médias, ou `None`.
+		resolver (ImageResolver | None): recherche des images originales, ou `None`.
+		add_source (bool): `True` pour ajouter l'adresse de la page en fin de document.
+
+	Returns:
+		str: document Markdown, terminé par un retour à la ligne.
+
+	Raises:
+		ValueError: sélecteur CSS invalide ou sans correspondance.
+	"""
 	soup = BeautifulSoup(content, HTML_PARSER)
 
 	# Nettoyage global, titre, puis repérage du contenu principal
@@ -863,11 +1218,14 @@ def convert_page(content, base_url, selector, downloader, resolver, add_source):
 # Programme principal
 # ---------------------------------------------------------------------------
 
-def parse_arguments():
-	"""Définit et lit les options de la ligne de commande."""
+def parse_arguments() -> argparse.Namespace:
+	"""Définit et lit les options de la ligne de commande.
+
+	Returns:
+		argparse.Namespace: options lues (`url`, `input`, `base_url`, `output`, `selector`,`download_media`, `media_dir`, `no_original_images`,`add_source`, `timeout`, `user_agent`).
+	"""
 	parser = argparse.ArgumentParser(
-		description = 'Convertit une page Web en Markdown '
-		              '(contenu principal, médias et blocs de code).',
+		description = 'Convertit une page Web en Markdown (contenu principal, médias et blocs de code).',
 	)
 	parser.add_argument(
 		'--url',
@@ -877,14 +1235,13 @@ def parse_arguments():
 	parser.add_argument(
 		'--input',
 		metavar = 'FICHIER',
-		help = 'fichier HTML local à convertir (« - » ou rien : entrée standard)',
+		help = 'fichier HTML local à convertir (« - » ou rien : entrée standard)',
 	)
 	parser.add_argument(
 		'--base-url',
 		metavar = 'URL',
 		default = '',
-		help = 'adresse d\'origine de la page, pour rendre les liens relatifs absolus '
-		       '(utile avec --input)',
+		help = 'adresse d\'origine de la page, pour rendre les liens relatifs absolus (utile avec --input)',
 	)
 	parser.add_argument(
 		'--output',
@@ -894,8 +1251,7 @@ def parse_arguments():
 	parser.add_argument(
 		'--selector',
 		metavar = 'CSS',
-		help = 'sélecteur CSS du contenu principal, si la détection automatique se trompe '
-		       '(ex. : "div.post-body")',
+		help = 'sélecteur CSS du contenu principal, si la détection automatique se trompe (ex. : "div.post-body")',
 	)
 	parser.add_argument(
 		'--download-media',
@@ -905,8 +1261,7 @@ def parse_arguments():
 	parser.add_argument(
 		'--media-dir',
 		metavar = 'DOSSIER',
-		help = 'dossier des médias téléchargés (active --download-media ; '
-		       'par défaut : <sortie>_media, ou « media » sans --output)',
+		help = 'dossier des médias téléchargés (active --download-media ; par défaut : <sortie>_media, ou « media » sans --output)',
 	)
 	parser.add_argument(
 		'--no-original-images',
@@ -924,19 +1279,30 @@ def parse_arguments():
 		metavar = 'SECONDES',
 		type = int,
 		default = 30,
-		help = 'délai maximal de chaque requête réseau (par défaut : 30)',
+		help = 'délai maximal de chaque requête réseau (par défaut : 30)',
 	)
 	parser.add_argument(
 		'--user-agent',
 		metavar = 'TEXTE',
 		default = DEFAULT_USER_AGENT,
-		help = "identifiant du navigateur envoyé aux sites (par défaut : Firefox)",
+		help = "identifiant du navigateur envoyé aux sites (par défaut : Firefox)",
 	)
 	return parser.parse_args()
 
 
-def load_html(args):
-	"""Retourne le contenu HTML (octets) et l'adresse de base de la page."""
+def load_html(args: argparse.Namespace) -> tuple[bytes, str]:
+	"""Lit la page depuis le Web (`--url`), un fichier (`--input`) ou l'entrée standard.
+
+	Args:
+		args (argparse.Namespace): options de la ligne de commande.
+
+	Returns:
+		tuple[bytes, str]: contenu HTML brut et adresse de base de la page (URL finale après redirections, ou `--base-url`).
+
+	Raises:
+		requests.RequestException: échec du téléchargement de la page.
+		OSError: impossible de lire le fichier local.
+	"""
 	if args.url:
 		log(f'⏳ Téléchargement de {args.url}…')
 		response = requests.get(
@@ -955,7 +1321,12 @@ def load_html(args):
 	return sys.stdin.buffer.read(), args.base_url
 
 
-def main():
+def main() -> int:
+	"""Point d'entrée : lit la page, la convertit et écrit le Markdown.
+
+	Returns:
+		int: code de sortie du programme (`0` = succès, `1` = erreur).
+	"""
 	args = parse_arguments()
 
 	# Force l'UTF-8 sur les flux standard (utile surtout sous Windows)

@@ -7,6 +7,9 @@ Fonctionnement :
 	1. Pandoc fait la conversion Markdown -> DokuWiki. Un petit filtre Lua
 	   (embarqué dans ce script) remplace les blocs de code par des blocs
 	   du plugin CodePrism : <codeprism lang=python> ... </codeprism>.
+	   Les options des blocs sont reprises, y compris la syntaxe MkDocs :
+	     ```python title="hello.py" hl_lines="2 4-5" linenums="10"
+	     ```{.python .line-numbers title="hello.py"}
 	2. Le texte obtenu est ensuite « typographié » à la française :
 	   - espaces insécables avant « : ; ! ? » et à l'intérieur des guillemets ;
 	   - guillemets droits ou courbes remplacés par des guillemets français ;
@@ -18,7 +21,13 @@ Exemples :
 	python3 md2dokuwiki.py --input page.md --output page.txt
 	python3 md2dokuwiki.py --input page.md > page.txt
 	cat page.md | python3 md2dokuwiki.py > page.txt
+
+Documentation :
+	python3 -m pydoc md2dokuwiki
 """
+
+# Annotations de type évaluées à la demande (syntaxe « list[str] » dès Python 3.7)
+from __future__ import annotations
 
 import argparse
 import re
@@ -56,38 +65,66 @@ local ALIASES = {
 
 -- Attributs CodePrism que l'on peut transmettre depuis le Markdown, par ex. :
 --   ```{.python title=hello.py hl=2-4}
-local PASSTHROUGH = { "title", "el", "sl", "hl", "cmd", "cmdout", "css", "user" }
+local PASSTHROUGH = { "title", "cmd", "cmdout", "css", "user" }
+
+-- Classes qui demandent la numérotation des lignes (Pandoc, Prism.js)
+local LINE_NUMBER_CLASSES = { numberLines = true, ["line-numbers"] = true }
+
+-- Écrit « clé=valeur », entre guillemets si la valeur contient des espaces
+local function attribute(key, value)
+	if value:find("%s") then
+		value = '"' .. value:gsub('"', "'") .. '"'
+	end
+	return " " .. key .. "=" .. value
+end
 
 function CodeBlock(block)
 	local tag = "<codeprism"
+	local attrs = block.attributes
+	local numbered = false
 
-	-- Le premier « classe » du bloc est le langage (```python)
-	local lang = block.classes[1]
-	if lang and lang ~= "numberLines" then
-		lang = ALIASES[lang:lower()] or lang
-		tag = tag .. " lang=" .. lang
-	end
-
-	-- Numérotation des lignes : ```{.python .numberLines startFrom="10"}
+	-- La première classe qui n'est pas une option est le langage (```python)
 	for _, class in ipairs(block.classes) do
-		if class == "numberLines" then
-			tag = tag .. " el=true"
+		if LINE_NUMBER_CLASSES[class] then
+			numbered = true
+		elseif not tag:find(" lang=") then
+			tag = tag .. " lang=" .. (ALIASES[class:lower()] or class)
 		end
 	end
-	if block.attributes["startFrom"] then
-		tag = tag .. " sl=" .. block.attributes["startFrom"]
+
+	-- Numéro de la première ligne : startFrom (Pandoc), linenums (MkDocs)
+	-- ou sl (CodePrism). Avec linenums="1", la numérotation est activée.
+	local start = attrs["sl"] or attrs["startFrom"] or attrs["linenums"]
+	if attrs["linenums"] or attrs["el"] == "true" then
+		numbered = true
+	end
+	if numbered then
+		tag = tag .. " el=true"
+	end
+	if start and start:match("^%d+$") and start ~= "1" then
+		tag = tag .. " sl=" .. start
+	end
+
+	-- Lignes surlignées : hl_lines="2 4-6" (MkDocs) ou hl=2,4-6 (CodePrism).
+	-- Les séparateurs (espaces, virgules) sont normalisés en virgules.
+	local hl = attrs["hl"] or attrs["hl_lines"]
+	if hl then
+		hl = hl:gsub("^[%s,]+", ""):gsub("[%s,]+$", ""):gsub("[%s,]+", ",")
+		if hl ~= "" then
+			tag = tag .. " hl=" .. hl
+		end
 	end
 
 	-- Autres attributs CodePrism transmis tels quels
 	for _, key in ipairs(PASSTHROUGH) do
-		local value = block.attributes[key]
-		if value then
-			tag = tag .. " " .. key .. "=" .. value
+		local value = attrs[key]
+		if value and value ~= "" then
+			tag = tag .. attribute(key, value)
 		end
 	end
 
 	-- Bloc brut : Pandoc l'écrit tel quel dans la sortie DokuWiki
-	return pandoc.RawBlock("dokuwiki", tag .. ">\n" .. block.text .. "\n</codeprism>")
+	return pandoc.RawBlock("dokuwiki", tag .. ">\n" .. block.text .. "\n</codeprism>\n")
 end
 '''
 
@@ -115,10 +152,28 @@ PROTECTED_PATTERNS = [
 # Protection / restauration des zones sensibles
 # ---------------------------------------------------------------------------
 
-def protect(text, pattern, store, flags):
-	"""Remplace chaque occurrence du motif par un jeton et la mémorise."""
+def protect(text: str, pattern: str, store: list[str], flags: int | re.RegexFlag) -> str:
+	"""Remplace chaque occurrence du motif par un jeton et la mémorise.
 
-	def _replace(match):
+	Args:
+		text (str): texte à traiter.
+		pattern (str): expression régulière des zones à protéger.
+		store (list[str]): liste des textes protégés, complétée sur place ; le numéro d'un jeton est l'indice de son texte.
+		flags (int | re.RegexFlag): drapeaux de l'expression régulière.
+
+	Returns:
+		str: texte où chaque zone protégée est remplacée par un jeton `TOKEN_START` + numéro + `TOKEN_END`.
+	"""
+
+	def _replace(match: re.Match[str]) -> str:
+		"""Mémorise le texte trouvé et renvoie son jeton.
+
+		Args:
+			match (re.Match[str]): zone à protéger.
+
+		Returns:
+			str: jeton numéroté qui la remplace.
+		"""
 		# On garde le texte original et on renvoie un jeton numéroté
 		store.append(match.group(0))
 		return TOKEN_START + str(len(store) - 1) + TOKEN_END
@@ -126,8 +181,16 @@ def protect(text, pattern, store, flags):
 	return re.sub(pattern, _replace, text, flags = flags)
 
 
-def restore(text, store):
-	"""Remet en place les textes d'origine à la place des jetons."""
+def restore(text: str, store: list[str]) -> str:
+	"""Remet en place les textes d'origine à la place des jetons.
+
+	Args:
+		text (str): texte contenant des jetons.
+		store (list[str]): textes protégés, remplis par `protect()`.
+
+	Returns:
+		str: texte sans aucun jeton.
+	"""
 	token = re.compile(TOKEN_START + r'(\d+)' + TOKEN_END)
 
 	# Boucle : un fragment protégé peut lui-même contenir un jeton
@@ -140,8 +203,16 @@ def restore(text, store):
 # Typographie française
 # ---------------------------------------------------------------------------
 
-def apply_french_typography(text, add_missing_spaces):
-	"""Applique les règles typographiques françaises à un texte (déjà protégé)."""
+def apply_french_typography(text: str, add_missing_spaces: bool) -> str:
+	"""Applique les règles typographiques françaises à un texte déjà protégé.
+
+	Args:
+		text (str): texte DokuWiki dont les zones sensibles sont remplacées par des jetons.
+		add_missing_spaces (bool): `True` pour ajouter l'espace insécable manquante avant « : ; ! ? » (« Bonjour! » -> « Bonjour ! »).
+
+	Returns:
+		str: texte typographié.
+	"""
 
 	# 1) Apostrophes courbes -> apostrophes droites
 	text = re.sub('[\u2019\u2018\u02bc]', "'", text)
@@ -185,9 +256,17 @@ def apply_french_typography(text, add_missing_spaces):
 	return text
 
 
-def typographize(dokuwiki_text, add_missing_spaces):
-	"""Protège les zones sensibles, applique la typographie, puis restaure."""
-	store = []
+def typographize(dokuwiki_text: str, add_missing_spaces: bool) -> str:
+	"""Protège les zones sensibles, applique la typographie, puis les restaure.
+
+	Args:
+		dokuwiki_text (str): texte DokuWiki produit par Pandoc.
+		add_missing_spaces (bool): `True` pour ajouter l'espace insécable manquante avant « : ; ! ? ».
+
+	Returns:
+		str: texte DokuWiki typographié (code, liens et URL inchangés).
+	"""
+	store: list[str] = []
 	protected = dokuwiki_text
 
 	for pattern, flags in PROTECTED_PATTERNS:
@@ -198,11 +277,98 @@ def typographize(dokuwiki_text, add_missing_spaces):
 
 
 # ---------------------------------------------------------------------------
+# Normalisation des blocs de code
+# ---------------------------------------------------------------------------
+
+# Ligne d'ouverture ou de fermeture d'un bloc de code délimité
+FENCE_LINE = re.compile(r'^([ \t]*)(`{3,}|~{3,})(.*?)\s*$')
+
+# Éléments d'une ligne d'information : clé=valeur (valeur éventuellement
+# entre guillemets), .classe, ou mot seul (le langage)
+INFO_TOKEN = re.compile(r'''([\w-]+)=("[^"]*"|'[^']*'|\S+)|(\S+)''')
+
+
+def info_to_pandoc(info: str) -> str:
+	"""Convertit une ligne d'information de style MkDocs en attributs Pandoc.
+
+	Exemple : ```python title="hello.py" hl_lines="2 3" .line-numbers```
+	devient ```{.python .line-numbers title="hello.py" hl_lines="2 3"}```
+
+	Args:
+		info (str): texte qui suit la barrière d'ouverture « ``` ».
+
+	Returns:
+		str: attributs Pandoc entre accolades.
+	"""
+	classes: list[str] = []
+	attributes: list[str] = []
+
+	for match in INFO_TOKEN.finditer(info):
+		key, value, word = match.groups()
+		if key:
+			# Retire les guillemets éventuels, puis les remet (sans « " » interne)
+			if value[:1] in '"\'' and value[-1:] == value[:1]:
+				value = value[1:-1]
+			attributes.append(f'{key}="{value.replace(chr(34), chr(39))}"')
+		else:
+			# « .classe » ou mot seul : dans les deux cas, une classe Pandoc
+			classes.append('.' + word.lstrip('.'))
+
+	return '{' + ' '.join(classes + attributes) + '}'
+
+
+def normalize_code_fences(markdown: str) -> str:
+	"""Réécrit les lignes d'ouverture des blocs de code pour Pandoc.
+
+	Pandoc ne reconnaît pas ```python title="x" hl_lines="2" (syntaxe MkDocs) : il n'accepte qu'un mot seul ou des attributs entre accolades. Les blocs déjà écrits avec des accolades ou un mot seul sont laissés tels quels.
+
+	Args:
+		markdown (str): document Markdown.
+
+	Returns:
+		str: document Markdown dont les barrières d'ouverture sont compréhensibles par Pandoc.
+	"""
+	lines = markdown.split('\n')
+	fence: str | None = None  # Délimiteur du bloc en cours (None hors d'un bloc)
+
+	for index, line in enumerate(lines):
+		match = FENCE_LINE.match(line)
+		if not match:
+			continue
+		indent, marker, info = match.groups()
+
+		if fence is None:
+			# Ouverture : une barrière « ` » ne peut pas contenir de « ` »
+			if marker[0] == '`' and '`' in info:
+				continue
+			fence = marker
+			info = info.strip()
+			if info and not info.startswith('{') and (len(info.split()) > 1 or info.startswith('.')):
+				lines[index] = indent + marker + info_to_pandoc(info)
+		elif marker[0] == fence[0] and len(marker) >= len(fence) and not info.strip():
+			# Fermeture : même caractère, au moins aussi long, rien derrière
+			fence = None
+
+	return '\n'.join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Appel de Pandoc
 # ---------------------------------------------------------------------------
 
-def run_pandoc(markdown, pandoc_path):
-	"""Convertit le Markdown en DokuWiki avec Pandoc et le filtre Lua."""
+def run_pandoc(markdown: str, pandoc_path: str) -> str:
+	"""Convertit le Markdown en DokuWiki avec Pandoc et le filtre Lua.
+
+	Args:
+		markdown (str): document Markdown à convertir.
+		pandoc_path (str): commande ou chemin de l'exécutable Pandoc.
+
+	Returns:
+		str: texte DokuWiki produit par Pandoc (blocs de code en CodePrism).
+
+	Raises:
+		RuntimeError: Pandoc s'est terminé en erreur (message de Pandoc joint).
+	"""
 
 	# Le filtre Lua doit exister sous forme de fichier : on le crée
 	# dans un dossier temporaire supprimé automatiquement.
@@ -227,7 +393,7 @@ def run_pandoc(markdown, pandoc_path):
 
 		result = subprocess.run(
 			command,
-			input = markdown,
+			input = normalize_code_fences(markdown),
 			capture_output = True,
 			text = True,
 			encoding = 'utf-8',
@@ -243,8 +409,12 @@ def run_pandoc(markdown, pandoc_path):
 # Programme principal
 # ---------------------------------------------------------------------------
 
-def parse_arguments():
-	"""Définit et lit les options de la ligne de commande."""
+def parse_arguments() -> argparse.Namespace:
+	"""Définit et lit les options de la ligne de commande.
+
+	Returns:
+		argparse.Namespace: options lues (`input`, `output`, `pandoc`, `skip_typography`, `no_add_missing_spaces`).
+	"""
 	parser = argparse.ArgumentParser(
 		description = 'Convertit un document Markdown en DokuWiki '
 		              '(code via CodePrism, typographie française).',
@@ -278,7 +448,12 @@ def parse_arguments():
 	return parser.parse_args()
 
 
-def main():
+def main() -> int:
+	"""Point d'entrée : lit le Markdown, le convertit et écrit le texte DokuWiki.
+
+	Returns:
+		int : code de sortie du programme (`0` = succès, `1` = erreur).
+	"""
 	args = parse_arguments()
 
 	# Force l'UTF-8 sur les flux standard (utile surtout sous Windows)
